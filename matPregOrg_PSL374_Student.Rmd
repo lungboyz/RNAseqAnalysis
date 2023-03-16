@@ -1,0 +1,549 @@
+---
+title: "Maternal organ changes during pregnancy"
+author: "Brian Cox"
+date: "08/09/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+These are mouse adult organs harvested from day 14 pregnant mice (20-21 days is term gestation) and non-pregnant mice (age matched, 8-12 weeks old). Selected organs are liver, lung and heart. Liver is previously characterized by gene expression analysis and only a little data is available on lung and heart tissues during pregnancy. The data set is real, novel and unpublished (i.e. don't go looking for a paper to copy). I have provided two papers, one a review of the physiological adaptations of pregnancy the other a gene expression study of liver, kidney and small intestine during pregnancy. You should look for other supporting and background papers as needed. 
+
+
+# libraries for data processing and analysis
+```{r}
+# table wrangling and graphing
+library(tidyverse)
+#BiocManager::install("biomaRt")
+#BiocManager::install("genefilter")
+#BiocManager::install("qusage")
+# annotation files
+library(biomaRt)
+# working with RNA-sequencing data, normalization
+library(edgeR)
+#differential expression
+library(limma)
+#using gene sets
+library(qusage)
+#graphing
+library(ggplot2)
+#heatmaps and clustering
+library(pheatmap)
+#data processing for gene expression
+library(genefilter)
+
+library(plyr)
+
+library(DT)
+
+```
+
+So we can load data into Cytoscape we need a particular formatted file. This is called the generic file in Cytoscape. This is done though a custom function called buildGeneric(). 
+
+# 
+```{r}
+buildGeneric<-function(ontIndex, tests, gData){
+  #the ontology index file with genes
+  ontIndex=ontIndex
+  #the test results from camera
+  tests=tests
+  #convert the Direction to +1 and -1
+  tests$Direction[tests$Direction=="Down"]<- -1
+  tests$Direction[tests$Direction=="Up"]<- 1
+ 
+  #the array or seq data in a DGE or Eset object
+  gData=gData
+  #the list of gene names
+  gLists<-lapply(rownames(tests), function(x) paste(c(gData$genes$external_gene_name[unlist(ontIndex[names(ontIndex)==x])]), collapse = ","))
+  
+  #Put it together
+  dfGenes<-ldply(gLists, data.frame)
+  result<-data.frame(GO.ID=rownames(tests), Description= rownames(tests), tests[,c(3,4,2)], genes=dfGenes)
+  return(result)
+}
+
+
+
+```
+
+#Mouse gene annotation
+Biomart is a large database of gene annotation that can be accessed though R commands. 
+It is maintained by the ENSEMBL consortium. Here we can get the name and location of genes and their transcripts. As well we can access a large variety of other annotations. 
+```{r}
+#open up a market of annotations for selection
+mart <- biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                         dataset = "mmusculus_gene_ensembl",
+                         host = "useast.ensembl.org")
+
+#get a list of available annotations
+#listAttributes(mart = mart)
+```
+
+
+We need to get the gene ID, a symbol ID and transcript ID. Recall that one gene is a defined locus in the genome, but each gene may make more than one transcript. The sequencing alignment is based on transcripts. To perform our analysis we will need to map the transcript back to a gene and merge all of the the counting data of the transcripts back to a singe gene. 
+```{r}
+
+# Target Mapping via BioMart
+ttg <- biomaRt::getBM(
+  attributes = c("ensembl_transcript_id",
+                 "ensembl_gene_id", "external_gene_name", "description",
+                 "transcript_biotype", "entrezgene_id"),  mart = mart)
+ttg
+
+t2g<-ttg[,c(1,2,3,6)]
+t2g <- dplyr::rename(t2g, target_id = ensembl_transcript_id,
+                     ens_gene = ensembl_gene_id, ext_gene = external_gene_name, entrez=entrezgene_id)
+
+```
+
+
+The alignment of RNA sequences to the genome was completed for you and the raw data tables was save as an R object. Also is a table of the sample names.  
+```{r}
+load("PregOrgans.Rdata")
+
+head(countsMerged)
+head(meta)
+```
+
+
+
+The library EdgeR creates a complex data object called a DGEList to hold the count table of data, the annotation of the genes and the annotation of the samples. This is a differential gene expression list. It stores all the information in one data object with links between the data tables. Counts are the counts of the gene expression. genes are the annotation of the detected genes and samples is the annotation of the sample (organ, age, genotype etc. anything you want). Several other positions in the list hold normalization statistics and transformed versions of the tables. 
+
+```{r}
+# create the DGEList object from the  table
+
+
+y <- DGEList(countsMerged)
+names(y)
+y$samples
+```
+
+## annotation
+Lets bring in the gene annotation. The genes detected in the countsMerged table is now the rownames of the DGELIst object. This list must be matched to the annotation we obtained from biomart. 
+```{r}
+#genes in our experiment
+geneid <- data.frame(geneid=rownames(y))
+
+#gene annotation from biomart
+esembl<-unique(ttg[, c(2:3,6)])
+dup<-duplicated(esembl)
+esemblClean<-esembl[!dup,]
+```
+
+## merging the two tables
+```{r}
+# merging our experiment with the annotation
+genes<-merge(x=geneid,y=esemblClean, by.x="geneid", by.y = "ensembl_gene_id", no.dups = T, all.x = TRUE)
+
+#removing duplicates
+dup2<-duplicated(genes$geneid)
+summary(dup2)
+genesClean<-genes[!dup2,]
+```
+
+## ensuring we did this correctly
+```{r}
+#checking that this all worked, verify the tables are the same size
+dim(genesClean)
+dim(geneid)
+dim(y)
+
+#verify that the names match and are in order. 
+summary(genesClean$geneid==rownames(y))
+
+#update the table with the gene symbols (more human readable)
+rownames(genesClean)<-genesClean$geneid
+
+```
+
+## sample data
+Now that the genes are annotated correctly we need to annotate the samples. It is important to know what the samples are (liver, heart, lung) so we can test what genes are different between the conditions (pregnant, non-pregnant). An important need in the annotation table is a column called group. When we normalize the data this column is important. In this case the group was pregnancy. Group can only be a binary variable.
+
+```{r}
+#pre-processing
+
+y$samples<-data.frame(y$samples, meta)
+y$genes<-genesClean
+
+colnames(y$counts)<-rownames(meta)
+
+#NOTE samples must have column group!!!
+
+```
+
+## data cleaning
+Count data can have samples with all 0 genes detected as gene expression was compared to a fixed database of gene sequences. If nothing is detected a 0 is written into the table. As well there can be detection of low expression, such as only a few counts and not in all samples. THese genes may be below our detection limit or they may be "noise"; the results of small errors in gene expression. 
+```{r}
+cpm <- cpm(y$counts)
+lcpm <- cpm(y$counts, log=TRUE)
+L <- mean(y$samples$lib.size) * 1e-6
+M <- median(y$samples$lib.size) * 1e-6
+c(L, M)
+
+```
+
+
+```{r}
+
+#remove low expressed genes
+plot(y$counts[,1], cpm[,1])
+keep.exprs<-rowSums(cpm>1)>=3
+y2<-y[keep.exprs,keep.lib.sizes=F]
+
+```
+
+Now that low expressing gene are filtered check how many were removed/left.
+```{r}
+
+lcpm.cutoff <- log2(10/M + 2/L)
+library(RColorBrewer)
+nsamples <- ncol(y)
+col <- brewer.pal(nsamples, "Paired")
+par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", legend=y$samples$tissue, text.col=col, bty="n")
+lcpm <- cpm(y2, log=TRUE)
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(lcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", legend=y2$samples$tissue, text.col=col, bty="n")
+
+dim(y)
+dim(y2)
+
+```
+
+## Normalizing and transforming the data
+The data is normalized to make the samples comparable. Differences in the experiments, the total number of sequences generated can artificially make samples appear to have more or less expression. To normalize we will re scale the samples to make them have the same number of sequences. 
+Counting data can be statistically compared using Poisson statistical analysis as it is counting data. In actuality it is more complex and instead uses a negative binomial distribution. This means it is not normal and we cannot apply standard linear or normal (Gaussian) statistical analyses. We can transform the counting data using a variety of methods to make it more linear or Gaussian. One methods is in the limma library and is called voom()
+
+```{r}
+#voom
+#here the design matrix solves for gene expression as a function of pregnancy status only
+#this was in the sample data as the column group
+
+par(mfrow=c(1,2))
+lcpm <- cpm(y2, log=TRUE)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="A. Example: Unnormalised data",ylab="Log-cpm")
+
+y2 <- calcNormFactors(y2)  
+y2$samples$norm.factors
+
+lcpm <- cpm(y2, log=TRUE)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="B. Example: Normalised data",ylab="Log-cpm")
+
+```
+
+We want to know how pregnancy affects gene expression in each of the three organs. For this we need a new design that accounts for both pregnancy and the organ. Then we can apply this design against the voom transformation.
+
+```{r}
+
+design <- model.matrix(~0 + paste0(y2$samples$tissue, y2$samples$group.1), data = y2$samples)
+colnames(design)<-c("HC","HP","liverC","liverP","lungC","lungP")
+v <- voom(y2, design)
+v
+```
+
+
+But was this even a good experiment? are the samples correct and grouping?
+In high dimension data sets, data with lost of variables, dimension reduction methods help to graphically interpret the data. There are 1000s of genes measured so we would need 1000s of axis to graph the relationships. To reduce this we can apply principal component analysis or PCA. PCA looks for relationships in the genes/variables and identifies collections or components of the genes. There as many components as samples. A component is composed of the weighted contributions of all genes. Some contribute strongly positive, other can be negative and other very little. This is done so that each component is independent of each other. Each component can explain or will contain a proportion of all the variance in the data. Some variance explains being pregnant or not pregnant. Some is being a heart or a lung. Some is noise or conditions in the experiment we are not aware of, like some animals being a different genetic strain of mouse, or having a different number of embryos in its pregnancy. 
+
+```{r}
+# collect the expression data
+data<-v$E
+
+#calculate the PCA, note the data orientation is rotated using t(); transpose
+pca<-prcomp(t(data))
+
+# collect the PC data
+ggData<-data.frame(pca$x[,1:6], v$targets)
+
+
+```
+
+
+Lets look how much of the total variance each component can explain.
+
+
+```{r}
+
+sum_pca<-summary(pca)
+var_pca<-sum_pca$importance[2,1:3]
+barplot(sum_pca$importance[2,]*100, ylab="Percent Variance", xlab="Principal Component", las=2)
+
+
+```
+From the graph nearly all the variance is explained in the first two components
+
+Now lets graph the first two components
+```{r}
+#PCA uncorrected data
+ggplot(ggData, aes(x=PC1, y=PC2, color=factor(v$targets$tissue), label=colnames(v))) +
+  geom_text()
+```
+
+From the PCA graph it is clear that some samples are not grouping with their replicates. 
+We likely need to remove outliers, lung_P4, liver_P3 and H_P4, poor or contaminated?
+
+We will check if the samples are maybe mislabeled or contaminated. There are genes that can act as markers. Foxa2 labels endoderm derived organs (lung and liver), Alb or Albumin is a liver specific secreted gene, Nkx2.1 is a lung specific transcription factor and Nkx2.5 is a cardiac specific transcription factor. We will evaluate the expression of these markers in each of the samples.
+
+```{r}
+#extract a data set
+data2<-data.frame(v$genes$external_gene_name,data)
+
+#label the symbols
+colnames(data2)[1]<-"symbol"
+
+#create the plot of gene markers using a column plot (kind of like a bar graph)
+data2 %>% 
+  filter(grepl("Foxa2|Alb$|Nkx2.1|Nkx2.5",symbol)) %>% 
+  pivot_longer(cols = -symbol) %>% 
+  ggplot(aes(name, value, fill=symbol)) +
+  geom_col(position = "dodge", width = 0.75) +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+H_P4 looks more like liver. liver_P3 looks like it is liver but the lung marker is increased, so maybe the sample is cross contaminated. Similarly lung_P4 looks like it has some cardiac contamination. 
+
+We will remove the samples. Then recalculate the data. 
+ 
+
+```{r}
+#remove from y2 and create a y3 object
+y2$samples
+
+y3<-y2[, -c(10, 9, 11)]
+
+#verify the results
+y3$samples
+
+dim(y2)
+dim(y3)
+```
+
+Now that the data is clean lets finally determine if pregnancy changes gene expression. 
+
+Split off the data for each organ. Here we will start with liver, but independently you will adapt and modify the code to process the other organs (heart and lung)
+```{r}
+liver<-y3[,y3$samples$tissue=="liver"]
+dim(liver)
+#verify the results
+liver$samples
+```
+
+We want to repeat the analysis using different sets of samples, so to keep the code more generic let store a data set in a new variable (test) that we can change without updating all of the code. 
+
+```{r}
+test<-liver
+```
+
+Re-filter the data to remove low expression genes and calculate new normalization factors
+
+```{r}
+
+keep.exprs<-rowSums(cpm(test)>1)>=3
+test<-test[keep.exprs,keep.lib.sizes=F]
+dim(test)
+
+test <- calcNormFactors(test)
+
+```
+
+
+Set up the design of pregnant versus non-pregnant and voom transform the data
+
+
+```{r}
+#the design of the experiment
+design <- model.matrix(~0+test$samples$group.1, data = y3$samples)
+colnames(design)<-c("C", "P")
+
+#voom transform
+v <- voom(test, design)
+
+```
+
+Now lets look at the PCA again
+
+```{r}
+# collect the expression data
+data<-v$E
+
+#calculate the PCA, note the data orientation is rotated using t(); transpose
+pca<-prcomp(t(data))
+
+# collect the PC data
+ggData<-data.frame(pca$x[,1:6], v$targets)
+
+
+```
+
+
+Lets look how much of the total variance each component can explain.
+
+
+```{r}
+
+sum_pca<-summary(pca)
+var_pca<-sum_pca$importance[2,1:3]
+barplot(sum_pca$importance[2,]*100, ylab="Percent Variance", xlab="Principal Component", las=2)
+
+
+```
+From the graph nearly all the variance is explained in the first two components
+
+Now lets graph the first two components
+```{r}
+#PCA uncorrected data
+ggplot(ggData, aes(x=PC1, y=PC2, color=factor(v$targets$group.1), label=colnames(v))) +
+  geom_text()
+```
+There is separation of pregnancy samples to the left of PC1 (negative side) and non-pregnancy samples to the right (positive side). This is not the best separation and likely more sample should be used. Additionally there may be consistentcy in sampling location. 
+
+
+This fits all the relationships of the genes and samples to a series of linear models. 
+Recall the formula y= mX +b
+
+```{r}
+fit<-lmFit(v, design)
+
+```
+
+
+A contrast matrix is made to ask a specific question. In this case we are asking what is the difference in gene expression cased by pregnancy. Form the design matrix column names we can create equations. P-H for example is the log2 expression in pregnancy samples minus the log2 expression in control samples. Since we are in log2 transformed space this is the same as the ratio of the expression. Recall the rule about log functions. 
+log(x) -log(y) = log(x/y)
+
+```{r}
+contr.matrix <- makeContrasts(
+   preg = P-C, 
+   levels = colnames(design))
+contr.matrix
+```
+
+
+apply the contrast to the fitted model to determine those models that explain the difference in gene expression caused by pregnancy
+```{r}
+fit <- contrasts.fit(fit, contrasts=contr.matrix)
+efit <- eBayes(fit, robust = T)
+```
+
+Here is another quality control step. This checks if the variance in gene expression is even over all ranges of expression. variance should be the same in both high and low expressed genes
+
+```{r}
+plotSA(efit, main="Final model: Mean-variance trend")
+```
+
+The blue line is horizontal and the data should follow a uniform distribution around the line. Overall it looks pretty good. 
+
+We can collect a top table 
+```{r}
+topTable(efit, n=50)[,-c(1,3)]
+
+```
+
+
+## Gene set enrichment
+Strong changes in gene expression do not always explain the molecular changes. Sometimes small accumulated changes in the same pathway can result in significant changes overall. This is set enrichment, the collective changes in multiple genes that share a relationship, such as all being in the inflammatory response pathway, are statically different from random. 
+
+Gene sets can be obtained from a variety of sources. I selected this source as it is on campus. 
+
+```{r}
+#Link updated March
+# url="http://download.baderlab.org/EM_Genesets/current_release/Mouse/symbol/Mouse_GO_AllPathways_no_GO_iea_March_01_2021_symbol.gmt"
+# 
+# #BiocManager::install("qusage")
+# #library(qusage)
+# download.file(url, "Mouse_GO.gmt")
+
+goBP<-qusage::read.gmt("Mouse_GO.gmt")
+
+head(goBP)
+```
+
+Here we will index the object. THis is adding in the position that the genes occupies in your data table. This will enable camera to look up each gene and its statistical difference between the groups specified by your contrast matrix and design.
+
+```{r}
+#index the ontology to the locations of the genes in the eset object
+idx <- ids2indices(goBP,id=v$genes$external_gene_name) 
+
+head(idx)
+```
+
+Here we fit the data and test the fitted data to the indexed gene ontologies, then print the top 25 ontologies. If you get errors you may have a conflict with the design and contrast matrix if you make different version using the same variable names. 
+
+```{r}
+#create the camera analysis results
+
+camera(v,idx,design,contrast=contr.matrix,inter.gene.cor=0.01) 
+
+camliver <- camera(v,idx,design,contrast=contr.matrix[,1],inter.gene.cor=0.01) 
+
+datatable(camliver)
+
+```
+
+Looking at the heart results we observe many pathways enriched to pregnancy or non-pregnancy despite less than 40 genes being statistically different. 
+
+
+## Barcode plots
+
+Typically we plot the enrichment data using a barcode that combines the rank of the genes in the ontology and their density to show the significance. Here I have selected two examples from the camera result. One is increased, Mitochondrial translation, and one is decreased, steroid hydroxylase activity. This plot is used to highlight sets of interests. 
+
+```{r}
+
+barcodeplot(efit$t[,1], index=idx$`HALLMARK_G2M_CHECKPOINT%MSIGDB_C2%HALLMARK_G2M_CHECKPOINT`, main=tolower("Cell cycle G2M checkpoint"))
+
+barcodeplot(efit$t[,1], index=idx$`HALLMARK_G2M_CHECKPOINT%MSIGDB_C2%HALLMARK_G2M_CHECKPOINT`, index2 = idx$`cellular amino acid catabolic process%GObp%GO:0009063`, main=tolower("Cell cycle G2M checkpoint, amino acid catabolism"))
+
+
+barcodeplot(efit$t[,1], index=idx$`TRANS-GOLGI NETWORK VESICLE BUDDING%REACTOME%R-HSA-199992.3`, main=tolower("not significant"))
+```
+
+Next, save the camera results in a format that can be read by Cytoscape. This will use the custom function from above. 
+
+
+```{r}
+mytest<-buildGeneric(idx,camliver,v)
+head(mytest)
+write.table(mytest,"cameraLiverPvC_psl374.txt", quote=F, sep="\t", row.names = F)
+
+```
+
+# Lab report
+Repeat the processing of the data for the liver and the lung. Observe changes in the gene sets and use Cytoscape Enrichment maps to collect terms with similar genes to identify key processes or pathways affected by pregnancy in each organ. 
+
+Consider similarities and unique changes between the organs in response to pregnancy.
+
+In your report
+
+Consider your observations and report on what you think are findings of interest to the process of adaptation to pregnancy. Once you have selected and reviewed literature around these topics you can draft your report. 
+
+Consider if your molecular analysis supports other physiological changes that are observed in these organs. Does your analysis suggest whole new areas for exploration (new hypothesis generation)?
+
+_Introduction_,
+Make sure to state the problem under investigation, provide sufficient background to what is known and what are open questions, and specifically what you are addressing. Above all why is this an important topic to research?
+
+_Methods_,
+Since we did not extract the RNA etc. your methods should focus on your analysis. Normalization, transformations, differential expression, gene set enrichment and enrichment maps. 
+
+_Results_,
+Quality control should be noted but a figure or table may not be needed. There are three different organs. How you present these results is up to you. The point is to be concise and clear. Avoid redundant display of data like a table and a graph that detail the same results. Present at least one increased ontology and one decrease ontology. 
+
+_Discussion_,
+Here is where you should integrate your results with what is known in the literature. This literature should have been introduced in the introduction. Was there a question that you are specifically addressing? Are there data in the literature to compare your result with? Are the results suggesting a new research direction or hypothesis?  What could the impact be of the new hypothesis if true? Are there any caveats to your data that could lead to false interpretations? How to the increased or decreased ontologies fit with what we know about pregnancy.
+
+
